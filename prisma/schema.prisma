@@ -1,0 +1,791 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================
+// AUTH / TENANCY
+// ============================================================
+
+model User {
+  id            String   @id @default(cuid())
+  name          String
+  email         String   @unique
+  passwordHash  String?
+  image         String?
+  emailVerified DateTime?
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  memberships     OrganizationMember[]
+  createdAudits   AuditLog[]               @relation("AuditByUser")
+  notifications   Notification[]
+  receivedPayments Payment[]               @relation("PaymentReceivedBy")
+  performedInspections Inspection[]        @relation("InspectionPerformedBy")
+  createdRentals  Rental[]                 @relation("RentalCreatedBy")
+  createdExpenses Expense[]                @relation("ExpenseCreatedBy")
+  createdSignatures Signature[]            @relation("SignatureCreatedBy")
+  uploadedPhotos  InspectionPhoto[]        @relation("PhotoCapturedBy")
+}
+
+model Organization {
+  id              String   @id @default(cuid())
+  name            String
+  slug            String   @unique
+  logoUrl         String?
+  businessType    String   @default("Other")
+  currency        String   @default("PKR")
+  timezone        String   @default("Asia/Karachi")
+  address         String?
+  phone           String?
+  email           String?
+  settingsJson    String? // OrganizationSetting is preferred; kept for extensibility
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  members          OrganizationMember[]
+  customers        Customer[]
+  assets           Asset[]
+  assetCategories  AssetCategory[]
+  rentals          Rental[]
+  payments         Payment[]
+  deposits         Deposit[]
+  inspections      Inspection[]
+  damages          Damage[]
+  inspectionPhotos InspectionPhoto[]
+  expenses         Expense[]
+  budgets          Budget[]
+  maintenance      Maintenance[]
+  notifications    Notification[]
+  auditLogs        AuditLog[]
+  settings         OrganizationSetting[]
+  shareLinks       ShareLink[]
+  subscriptions    Subscription[]
+  documents        CustomerDocument[]
+  assetPhotos      AssetPhoto[]
+  assetDocuments   AssetDocument[]
+  invoices         Invoice[]
+  rentalCharges    RentalCharge[]
+  rentalExtensions RentalExtension[]
+  depositTransactions DepositTransaction[]
+  inspectionItems  InspectionItem[]
+  signatures       Signature[]
+  disputes         Dispute[]
+
+  @@index([slug])
+}
+
+model OrganizationMember {
+  id         String   @id @default(cuid())
+  orgId      String
+  userId     String
+  role       String   @default("Staff")
+  status     String   @default("active") // active | invited | disabled
+  createdAt  DateTime @default(now())
+
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId])
+  @@index([userId])
+}
+
+model OrganizationSetting {
+  id        String  @id @default(cuid())
+  orgId     String
+  key       String // e.g. "reminderTiming", "lateFeeRules", "depositRules", "inspectionRequirements", "fuelRules", "roundingRules"
+  value     String  // JSON serialized
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, key])
+  @@index([orgId])
+}
+
+// ============================================================
+// SUBSCRIPTIONS / BILLING (SaaS layer — payment provider abstracted)
+// ============================================================
+
+model Plan {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  description String?
+  priceMonthly Decimal @default(0)
+  maxAssets   Int?    @default(50)
+  maxUsers    Int?    @default(5)
+  maxRentalsPerMonth Int? @default(500)
+  features    String? // JSON
+  active      Boolean @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id               String   @id @default(cuid())
+  orgId            String
+  planId           String
+  status           String   @default("trial") // trial | active | past_due | cancelled
+  trialEndsAt      DateTime?
+  currentPeriodEnd DateTime?
+  provider         String?  // future: "stripe" | "manual"
+  providerRef      String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  plan Plan         @relation(fields: [planId], references: [id])
+
+  @@index([orgId])
+  @@index([planId])
+}
+
+model Invoice {
+  id         String   @id @default(cuid())
+  orgId      String
+  amount     Decimal  @default(0)
+  status     String   @default("draft") // draft | sent | paid | overdue | void
+  description String?
+  issuedAt   DateTime @default(now())
+  paidAt     DateTime?
+  createdAt  DateTime @default(now())
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+}
+
+// ============================================================
+// CUSTOMERS
+// ============================================================
+
+model Customer {
+  id                    String   @id @default(cuid())
+  orgId                 String
+  customerNo            String
+  name                  String
+  phone                 String
+  email                 String?
+  address               String?
+  city                  String?
+  country               String?
+  idType                String?
+  idNumber              String?
+  idExpiry              DateTime?
+  licenseNumber         String?
+  licenseExpiry         DateTime?
+  emergencyContactName  String?
+  emergencyContactPhone String?
+  notes                 String?
+  status                String   @default("active") // active | blocked | archived
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  org       Organization       @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  documents CustomerDocument[]
+  rentals   Rental[]
+
+  @@unique([orgId, customerNo])
+  @@index([orgId, status])
+  @@index([orgId, name])
+  @@index([orgId, phone])
+}
+
+model CustomerDocument {
+  id         String   @id @default(cuid())
+  orgId      String
+  customerId String
+  name       String
+  type       String   @default("other") // id | license | insurance | other
+  fileKey    String?
+  url        String?
+  expiresAt  DateTime?
+  uploadedBy String?
+  createdAt  DateTime @default(now())
+
+  org      Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  customer Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([customerId])
+}
+
+// ============================================================
+// ASSETS
+// ============================================================
+
+model AssetCategory {
+  id        String   @id @default(cuid())
+  orgId     String
+  name      String
+  kind      String   @default("equipment") // vehicle | generator | equipment | tool | electronics | other
+  description String?
+  customFieldsJson String? // JSON array of CustomFieldDef — category-specific asset attributes
+  createdAt DateTime @default(now())
+
+  org    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  assets Asset[]
+
+  @@unique([orgId, name])
+  @@index([orgId])
+}
+
+model Asset {
+  id                String   @id @default(cuid())
+  orgId             String
+  assetNo           String
+  name              String
+  categoryId        String
+  brand             String?
+  model             String?
+  serialNumber      String?
+  registrationNumber String?
+  vin               String?
+  engineNumber      String?
+  year              Int?
+  color             String?
+  mileage           Int? // current odometer km
+  fuelType          String?
+  transmission      String?
+  seatingCapacity   Int?
+  fuelTankCapacity  Decimal? // liters
+  engineHours       Int? // current meter hours
+  fuelLevel         Int? // percent
+  oilLevel          String?
+  voltage           String?
+  frequency         String?
+  powerOutput       String?
+  insuranceExpiry   DateTime?
+  registrationExpiry DateTime?
+  inspectionExpiry  DateTime?
+  purchaseDate      DateTime?
+  purchasePrice     Decimal?
+  currentValue      Decimal?
+  status            String   @default("available") // available | reserved | rented | inspection | maintenance | damaged | lost | retired
+  location          String?
+  description       String?
+  notes             String?
+  customFieldsJson  String? // JSON
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  org              Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  category         AssetCategory @relation(fields: [categoryId], references: [id])
+  photos           AssetPhoto[]
+  documents        AssetDocument[]
+  rentals          Rental[]
+  inspections      Inspection[]
+  damages          Damage[]
+  inspectionPhotos InspectionPhoto[]
+  expenses         Expense[]
+  maintenance      Maintenance[]
+
+  @@unique([orgId, assetNo])
+  @@index([orgId, status])
+  @@index([orgId, categoryId])
+  @@index([orgId, serialNumber])
+  @@index([orgId, registrationNumber])
+}
+
+model AssetPhoto {
+  id         String   @id @default(cuid())
+  orgId      String
+  assetId    String
+  url        String
+  fileKey    String?
+  caption    String?
+  uploadedBy String?
+  createdAt  DateTime @default(now())
+
+  org   Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  asset Asset        @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([assetId])
+}
+
+model AssetDocument {
+  id         String   @id @default(cuid())
+  orgId      String
+  assetId    String
+  name       String
+  type       String   @default("other")
+  fileKey    String?
+  url        String?
+  expiresAt  DateTime?
+  uploadedBy String?
+  createdAt  DateTime @default(now())
+
+  org   Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  asset Asset        @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([assetId])
+}
+
+// ============================================================
+// RENTALS
+// ============================================================
+
+model Rental {
+  id                String   @id @default(cuid())
+  orgId             String
+  rentalNo          String
+  customerId        String
+  assetId           String
+  status            String   @default("draft") // draft | reserved | awaiting_handover | active | due_soon | overdue | returned | inspection_pending | completed | cancelled | disputed
+  pricingModel      String   @default("daily") // hourly | daily | weekly | monthly | custom
+  rate              Decimal  @default(0)
+  quantity          Int      @default(1) // number of units of this asset rented
+  depositRequired   Decimal  @default(0)
+  discount          Decimal  @default(0)
+  taxPercent        Decimal  @default(0)
+  baseTotal         Decimal  @default(0) // computed rental price (rate x duration) - discount
+  chargesTotal      Decimal  @default(0) // sum of extra charges
+  taxTotal          Decimal  @default(0)
+  totalAmount       Decimal  @default(0) // final amount due for rental (not deposit)
+  amountPaid        Decimal  @default(0) // payments applied to rental (non-deposit)
+  depositHeld       Decimal  @default(0)
+  balance           Decimal  @default(0)
+  startAt           DateTime
+  expectedReturnAt  DateTime
+  actualReturnAt    DateTime?
+  durationHours     Decimal  @default(0)
+  notes             String?
+  createdBy         String
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  org             Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  customer        Customer     @relation(fields: [customerId], references: [id])
+  asset           Asset        @relation(fields: [assetId], references: [id])
+  createdByUser   User         @relation("RentalCreatedBy", fields: [createdBy], references: [id])
+  charges         RentalCharge[]
+  extensions      RentalExtension[]
+  payments        Payment[]
+  deposits        Deposit[]
+  inspections     Inspection[]
+  damages         Damage[]
+  disputes        Dispute[]
+  signatures      Signature[]
+  shareLinks      ShareLink[]
+  maintenanceBlocks Maintenance[] // maintenance booked during a rental period
+
+  @@unique([orgId, rentalNo])
+  @@index([orgId, status])
+  @@index([orgId, customerId])
+  @@index([orgId, assetId])
+  @@index([orgId, startAt])
+  @@index([orgId, expectedReturnAt])
+}
+
+model RentalCharge {
+  id         String   @id @default(cuid())
+  orgId      String
+  rentalId   String
+  type       String   @default("custom") // late | damage | fuel | mileage | cleaning | delivery | pickup | missing | custom
+  description String
+  amount     Decimal  @default(0)
+  qty        Decimal  @default(1)
+  unitRate   Decimal?
+  reason     String?
+  appliedAt  DateTime @default(now())
+  appliedBy  String
+
+  org    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  rental Rental       @relation(fields: [rentalId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([rentalId])
+}
+
+model RentalExtension {
+  id                String   @id @default(cuid())
+  orgId             String
+  rentalId          String
+  fromAt            DateTime
+  toAt              DateTime
+  durationHours     Decimal  @default(0)
+  additionalCost    Decimal  @default(0)
+  additionalDeposit Decimal  @default(0)
+  createdBy         String
+  createdAt         DateTime @default(now())
+
+  org    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  rental Rental       @relation(fields: [rentalId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([rentalId])
+}
+
+// ============================================================
+// PAYMENTS / DEPOSITS (ledger-based, auditable)
+// ============================================================
+
+model Payment {
+  id         String   @id @default(cuid())
+  orgId      String
+  rentalId   String
+  customerId String?
+  amount     Decimal
+  method     String   @default("cash") // cash | bank_transfer | card | online | other
+  type       String   @default("rental") // rental | deposit | refund | late | damage | additional
+  reference  String?
+  notes      String?
+  status     String   @default("completed") // completed | pending | failed | refunded
+  receivedBy String
+  receivedAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  org          Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  rental       Rental       @relation(fields: [rentalId], references: [id])
+  receivedByUser User       @relation("PaymentReceivedBy", fields: [receivedBy], references: [id])
+
+  @@index([orgId])
+  @@index([rentalId])
+  @@index([customerId])
+  @@index([orgId, receivedAt])
+}
+
+model Deposit {
+  id          String   @id @default(cuid())
+  orgId       String
+  rentalId    String
+  amount      Decimal
+  status      String   @default("pending") // pending | held | partially_returned | returned | deducted | forfeited
+  heldAt      DateTime?
+  returnedAt  DateTime?
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  org          Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  rental       Rental       @relation(fields: [rentalId], references: [id])
+  transactions DepositTransaction[]
+
+  @@index([orgId])
+  @@index([rentalId])
+}
+
+model DepositTransaction {
+  id           String   @id @default(cuid())
+  orgId        String
+  depositId    String
+  type         String   @default("received") // received | refunded | deducted | forfeited
+  amount       Decimal
+  reason       String?
+  authorizedBy String? // user that approved (for deductions above threshold)
+  createdBy    String
+  createdAt    DateTime @default(now())
+
+  org     Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  deposit Deposit      @relation(fields: [depositId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([depositId])
+}
+
+// ============================================================
+// INSPECTIONS
+// ============================================================
+
+model Inspection {
+  id               String   @id @default(cuid())
+  orgId            String
+  rentalId         String
+  assetId          String
+  type             String   // handover | return
+  status           String   @default("draft") // draft | in_progress | completed
+  startedAt        DateTime @default(now())
+  completedAt      DateTime?
+  performedBy      String
+  mileage          Int?
+  engineHours      Int?
+  fuelLevel        Int?
+  oilLevel         String?
+  notes            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  org       Organization      @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  rental    Rental            @relation(fields: [rentalId], references: [id], onDelete: Cascade)
+  asset     Asset             @relation(fields: [assetId], references: [id])
+  performedByUser User        @relation("InspectionPerformedBy", fields: [performedBy], references: [id])
+  items     InspectionItem[]
+  photos    InspectionPhoto[]
+  damages   Damage[]
+  signatures Signature[]
+
+  @@unique([rentalId, type])
+  @@index([orgId])
+  @@index([assetId])
+  @@index([orgId, status])
+}
+
+model InspectionItem {
+  id           String   @id @default(cuid())
+  orgId        String
+  inspectionId String
+  section      String   // meter | exterior | interior | functional | accessory | consumable | notes
+  label        String
+  category     String?
+  beforeValue  String?
+  afterValue   String?
+  status       String   @default("ok") // ok | issue | na | missing
+  notes        String?
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  org        Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  inspection Inspection   @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([inspectionId])
+}
+
+model InspectionPhoto {
+  id           String   @id @default(cuid())
+  orgId        String
+  inspectionId String
+  rentalId     String
+  assetId      String
+  category     String? // front | rear | left | right | roof | interior | dashboard | engine | tires | damage | other
+  url          String
+  fileKey      String?
+  caption      String?
+  positionX    Float? // damage diagram coordinates
+  positionY    Float?
+  damageId     String?
+  capturedAt   DateTime @default(now())
+  capturedBy   String
+
+  org        Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  inspection Inspection   @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  asset      Asset        @relation(fields: [assetId], references: [id])
+  capturedByUser User     @relation("PhotoCapturedBy", fields: [capturedBy], references: [id])
+
+  @@index([orgId])
+  @@index([inspectionId])
+  @@index([rentalId])
+}
+
+model Damage {
+  id                  String   @id @default(cuid())
+  orgId               String
+  rentalId            String
+  inspectionId        String?
+  assetId             String
+  category            String   @default("other") // scratch | dent | crack | broken | missing | fuel | other
+  location            String?
+  description         String
+  severity            String   @default("minor") // cosmetic | minor | moderate | major | critical
+  estimatedRepairCost Decimal  @default(0)
+  actualRepairCost    Decimal  @default(0)
+  status              String   @default("reported") // reported | under_review | customer_disputed | approved | repair_pending | repairing | resolved | rejected
+  positionX           Float?
+  positionY           Float?
+  isPreExisting       Boolean  @default(false) // distinguishes existing vs new damage
+  resolvedAt          DateTime?
+  notes               String?
+  reportedBy          String
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  org        Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  rental     Rental       @relation(fields: [rentalId], references: [id], onDelete: Cascade)
+  asset      Asset        @relation(fields: [assetId], references: [id])
+  inspection Inspection?  @relation(fields: [inspectionId], references: [id])
+
+  @@index([orgId])
+  @@index([rentalId])
+  @@index([assetId])
+  @@index([orgId, status])
+}
+
+model Signature {
+  id           String   @id @default(cuid())
+  orgId        String
+  inspectionId String
+  rentalId     String
+  role         String   // customer | staff
+  name         String
+  dataUrl      String   // base64 signature image
+  createdAt    DateTime @default(now())
+  createdBy    String
+
+  org        Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  inspection Inspection   @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  rental     Rental       @relation(fields: [rentalId], references: [id], onDelete: Cascade)
+  createdByUser User      @relation("SignatureCreatedBy", fields: [createdBy], references: [id])
+
+  @@index([orgId])
+  @@index([inspectionId])
+}
+
+// ============================================================
+// DISPUTES
+// ============================================================
+
+model Dispute {
+  id          String   @id @default(cuid())
+  orgId       String
+  rentalId    String
+  customerId  String?
+  assetId     String?
+  issue       String   // new_damage | missing_item | functional | payment | fuel | late_return | other
+  description String
+  amount      Decimal  @default(0)
+  status      String   @default("open") // open | under_review | customer_disputed | negotiation | resolved | rejected
+  resolution  String?
+  evidenceJson String?
+  resolvedAt  DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  org    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  rental Rental       @relation(fields: [rentalId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([rentalId])
+}
+
+// ============================================================
+// EXPENSES / BUDGETS / MAINTENANCE
+// ============================================================
+
+model Expense {
+  id          String   @id @default(cuid())
+  orgId       String
+  assetId     String?
+  category    String   // fuel | repairs | maintenance | insurance | registration | cleaning | parts | staff | transport | other
+  amount      Decimal
+  date        DateTime @default(now())
+  vendor      String?
+  description String?
+  receiptUrl  String?
+  receiptKey  String?
+  createdBy   String
+  createdAt   DateTime @default(now())
+
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  asset     Asset?       @relation(fields: [assetId], references: [id])
+  createdByUser User     @relation("ExpenseCreatedBy", fields: [createdBy], references: [id])
+
+  @@index([orgId])
+  @@index([assetId])
+  @@index([orgId, date])
+  @@index([orgId, category])
+}
+
+model Budget {
+  id        String   @id @default(cuid())
+  orgId     String
+  category  String   // maintenance | fuel | repairs | marketing | other
+  period    String   @default("monthly") // monthly | yearly
+  amount    Decimal
+  month     Int?
+  year      Int
+  threshold Decimal  @default(85) // warn at % used
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, category, period, month, year])
+  @@index([orgId])
+}
+
+model Maintenance {
+  id          String   @id @default(cuid())
+  orgId       String
+  assetId     String
+  type        String   // oil_change | tires | brake | engine | electrical | cleaning | general | inspection | other
+  status      String   @default("scheduled") // scheduled | in_progress | completed | overdue
+  date        DateTime @default(now())
+  mileage     Int?
+  engineHours Int?
+  cost        Decimal  @default(0)
+  vendor      String?
+  description String?
+  nextDate    DateTime?
+  nextMileage Int?
+  receiptUrl  String?
+  receiptKey  String?
+  createdBy   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  org    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  asset  Asset        @relation(fields: [assetId], references: [id])
+  rental Rental?      @relation(fields: [rentalId], references: [id])
+
+  rentalId String?
+
+  @@index([orgId])
+  @@index([assetId])
+  @@index([orgId, status])
+}
+
+// ============================================================
+// NOTIFICATIONS / AUDIT / SHARE
+// ============================================================
+
+model Notification {
+  id        String    @id @default(cuid())
+  orgId     String
+  userId    String? // null => org-wide notification
+  title     String
+  body      String?
+  type      String    // rental_due | overdue | payment_overdue | deposit_pending | inspection_pending | damage_detected | maintenance_due | document_expiry | budget_threshold | new_customer | rental_extension
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User?        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, readAt])
+  @@index([userId])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  orgId      String
+  userId     String
+  action     String   // created | updated | deleted | status_change | payment | refund | deduction | inspection | sign | upload | login
+  entityType String
+  entityId   String?
+  description String?
+  changes    String? // JSON diff
+  createdAt  DateTime @default(now())
+
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User         @relation("AuditByUser", fields: [userId], references: [id])
+
+  @@index([orgId])
+  @@index([orgId, entityType, entityId])
+  @@index([userId])
+}
+
+model ShareLink {
+  id        String    @id @default(cuid())
+  orgId     String
+  rentalId  String
+  token     String    @unique
+  expiresAt DateTime?
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  org    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  rental Rental       @relation(fields: [rentalId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([rentalId])
+}
