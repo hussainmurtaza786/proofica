@@ -5,11 +5,11 @@ import { prisma } from "@/lib/prisma";
 import { requirePermission } from "@/services/access";
 import { paymentSchema, depositRefundSchema } from "@/lib/validators";
 import { PERMISSIONS } from "@/lib/constants";
-import { toDecimal, money } from "@/lib/decimal";
+import { toDecimal } from "@/lib/decimal";
 import { audit } from "@/services/audit";
 import { notify } from "@/services/notify";
 import { getOrgSettings } from "@/services/settings";
-import { computeDepositRefund } from "@/lib/rental-math";
+import { computeDepositRefund, applyPaymentToLedger, applyDepositSettlement } from "@/lib/rental-math";
 import type { ActionResult } from "@/lib/actions";
 
 export async function recordPayment(_prev: ActionResult, formData: FormData): Promise<ActionResult> {
@@ -70,17 +70,23 @@ export async function recordPayment(_prev: ActionResult, formData: FormData): Pr
       }
     }
 
-    const newAmountPaid = money.add(rental.amountPaid, amount);
-    const newBalance = money.sub(rental.totalAmount, newAmountPaid);
-    const newDepositHeld =
-      data.type === "deposit" ? money.add(rental.depositHeld, amount) : rental.depositHeld;
+    // Deposit cash is tracked separately from rental revenue.
+    const ledger = applyPaymentToLedger({
+      totalAmount: rental.totalAmount,
+      amountPaid: rental.amountPaid,
+      depositPaid: rental.depositPaid,
+      depositHeld: rental.depositHeld,
+      type: data.type,
+      amount,
+    });
 
     await tx.rental.update({
       where: { id: data.rentalId },
       data: {
-        amountPaid: newAmountPaid,
-        balance: newBalance,
-        depositHeld: newDepositHeld,
+        amountPaid: ledger.amountPaid,
+        balance: ledger.balance,
+        depositPaid: ledger.depositPaid,
+        depositHeld: ledger.depositHeld,
       },
     });
   });
@@ -175,12 +181,16 @@ export async function finalizeDepositReturn(_prev: ActionResult, formData: FormD
       data: { status: newStatus, returnedAt: new Date(), notes: `Refund: ${refund}, Deductions: ${totalDeduction}` },
     });
 
-    const rental = deposit.rental;
-    const newAmountPaid = money.sub(rental.amountPaid, refund);
-    const newBalance = money.add(rental.balance, refund);
+    // Refunds and deductions both release funds from custody. Rental
+    // revenue (amountPaid/balance) is never touched by deposit settlement.
+    const newDepositHeld = applyDepositSettlement({
+      depositHeld: deposit.rental.depositHeld,
+      refund,
+      totalDeduction,
+    });
     await tx.rental.update({
-      where: { id: rental.id },
-      data: { amountPaid: newAmountPaid, balance: newBalance, depositHeld: money.sub(rental.depositHeld, refund) },
+      where: { id: deposit.rental.id },
+      data: { depositHeld: newDepositHeld },
     });
   });
 
@@ -230,20 +240,28 @@ export async function recordPaymentForRental(
         });
       }
     }
-    const newAmountPaid = money.add(rental.amountPaid, value);
+    const ledger = applyPaymentToLedger({
+      totalAmount: rental.totalAmount,
+      amountPaid: rental.amountPaid,
+      depositPaid: rental.depositPaid,
+      depositHeld: rental.depositHeld,
+      type,
+      amount: value,
+    });
     await tx.rental.update({
       where: { id: rentalId },
       data: {
-        amountPaid: newAmountPaid,
-        balance: money.sub(rental.totalAmount, newAmountPaid),
-        depositHeld: type === "deposit" ? money.add(rental.depositHeld, value) : rental.depositHeld,
+        amountPaid: ledger.amountPaid,
+        balance: ledger.balance,
+        depositPaid: ledger.depositPaid,
+        depositHeld: ledger.depositHeld,
       },
     });
   });
 
   await notify({
     orgId: ctx.orgId,
-    type: "payment_overdue",
+    type: "payment_received",
     title: "Payment received",
     body: `Payment of ${value} recorded on ${rental.rentalNo}.`,
     link: `/rentals/${rentalId}`,

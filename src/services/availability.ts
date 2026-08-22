@@ -2,18 +2,23 @@ import "server-only";
 
 import { prisma } from "@/lib/prisma";
 import { computeDurationHours } from "@/lib/rental-math";
+import type { Prisma } from "@prisma/client";
 
 /**
  * Checks whether an asset is available for the requested window.
  * Overlapping reservations in active states block the asset.
  * Also rejects assets whose current status cannot be rented.
+ *
+ * Pass a transaction client as `db` when calling inside a booking
+ * transaction that holds a row lock on the asset.
  */
 export async function isAssetAvailable(
   orgId: string,
   assetId: string,
   startAt: Date,
   endAt: Date,
-  excludeRentalId?: string
+  excludeRentalId?: string,
+  db: Prisma.TransactionClient = prisma as unknown as Prisma.TransactionClient
 ): Promise<{ available: boolean; conflicts: { rentalNo: string; startAt: Date; expectedReturnAt: Date; status: string }[] }> {
   const blockingStatuses = [
     "reserved",
@@ -25,7 +30,7 @@ export async function isAssetAvailable(
     "inspection_pending",
   ];
 
-  const asset = await prisma.asset.findFirst({ where: { id: assetId, orgId } });
+  const asset = await db.asset.findFirst({ where: { id: assetId, orgId } });
   if (!asset) return { available: false, conflicts: [] };
 
   if (!["available", "reserved"].includes(asset.status)) {
@@ -35,7 +40,7 @@ export async function isAssetAvailable(
     };
   }
 
-  const conflicts = await prisma.rental.findMany({
+  const conflicts = await db.rental.findMany({
     where: {
       orgId,
       assetId,

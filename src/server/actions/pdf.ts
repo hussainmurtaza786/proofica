@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { requireOrg } from "@/services/access";
 import { prisma } from "@/lib/prisma";
+import { resolveStoragePath } from "@/lib/storage";
 import { fmtDateTime } from "@/lib/dates";
 import type { InspectionReportData } from "@/components/pdf/inspection-report-document";
 import type { RentalAgreementData } from "@/components/pdf/rental-agreement-document";
@@ -11,10 +12,8 @@ import type { RentalAgreementData } from "@/components/pdf/rental-agreement-docu
 async function photoToDataUrl(url: string): Promise<string> {
   try {
     const key = url.replace(/^\/api\/files\//, "");
-    const storageDir = process.env.STORAGE_LOCAL_DIR || "storage";
-    const root = path.resolve(storageDir);
-    const filePath = path.resolve(path.join(process.cwd(), storageDir, key));
-    if (!filePath.startsWith(root)) return "";
+    const filePath = resolveStoragePath(key);
+    if (!filePath) return "";
     const buf = await readFile(filePath);
     const ext = path.extname(key).toLowerCase();
     const mime = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";

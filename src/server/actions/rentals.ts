@@ -14,6 +14,9 @@ import { computeRentalTotals, computeDurationHours, computeLateFee } from "@/lib
 import { getOrgSettings } from "@/services/settings";
 import type { ActionResult } from "@/lib/actions";
 
+// Not exported: "use server" files may only export async functions.
+class BookingConflictError extends Error {}
+
 export async function createRental(_prev: ActionResult, formData: FormData): Promise<ActionResult> {
   const ctx = await requirePermission(PERMISSIONS.createRental);
 
@@ -44,12 +47,6 @@ export async function createRental(_prev: ActionResult, formData: FormData): Pro
   const asset = await prisma.asset.findFirst({ where: { id: data.assetId, orgId: ctx.orgId } });
   if (!asset) return { ok: false, error: "Asset not found" };
 
-  const { available, conflicts } = await isAssetAvailable(ctx.orgId, data.assetId, startAt, expectedReturnAt);
-  if (!available) {
-    const detail = conflicts[0]?.rentalNo ?? asset.status;
-    return { ok: false, error: `Asset is not available for this period (${detail}).` };
-  }
-
   const settings = await getOrgSettings(ctx.orgId);
   const hours = computeDurationHours(startAt, expectedReturnAt);
   const breakdown = computeRentalTotals({
@@ -63,51 +60,73 @@ export async function createRental(_prev: ActionResult, formData: FormData): Pro
     rounding: settings.rentalRules.roundingRule,
   });
 
-  const rentalNo = await nextRentalNo(ctx.orgId);
+  // Availability is checked INSIDE the transaction while holding a row lock on
+  // the asset: two concurrent requests can no longer both pass the check and
+  // double-book (TOCTOU). The lock serializes them until commit.
+  let rental;
+  try {
+    rental = await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "Asset" WHERE "id" = ${data.assetId} AND "orgId" = ${ctx.orgId} FOR UPDATE`;
 
-  const rental = await prisma.$transaction(async (tx) => {
-    const created = await tx.rental.create({
-      data: {
-        orgId: ctx.orgId,
-        rentalNo,
-        customerId: data.customerId,
-        assetId: data.assetId,
-        status: "reserved",
-        pricingModel: data.pricingModel,
-        rate: toDecimal(data.rate),
-        quantity: data.quantity,
-        depositRequired: toDecimal(data.depositRequired),
-        discount: toDecimal(data.discount),
-        taxPercent: toDecimal(data.taxPercent),
-        baseTotal: breakdown.gross,
-        chargesTotal: breakdown.charges,
-        taxTotal: breakdown.taxAmount,
-        totalAmount: breakdown.total,
-        depositHeld: toDecimal(0),
-        amountPaid: toDecimal(0),
-        balance: breakdown.total,
-        startAt,
-        expectedReturnAt,
-        durationHours: toDecimal(hours),
-        notes: data.notes || null,
-        createdBy: ctx.userId,
-      },
-    });
+      const availability = await isAssetAvailable(ctx.orgId, data.assetId, startAt, expectedReturnAt, undefined, tx);
+      if (!availability.available) {
+        const detail = availability.conflicts[0]?.rentalNo ?? asset.status;
+        throw new BookingConflictError(`Asset is not available for this period (${detail}).`);
+      }
 
-    if (data.depositRequired > 0) {
-      await tx.deposit.create({
+      const rentalNo = await nextRentalNo(ctx.orgId);
+
+      const created = await tx.rental.create({
         data: {
           orgId: ctx.orgId,
-          rentalId: created.id,
-          amount: toDecimal(data.depositRequired),
-          status: "pending",
+          rentalNo,
+          customerId: data.customerId,
+          assetId: data.assetId,
+          status: "reserved",
+          pricingModel: data.pricingModel,
+          rate: toDecimal(data.rate),
+          quantity: data.quantity,
+          depositRequired: toDecimal(data.depositRequired),
+          discount: toDecimal(data.discount),
+          taxPercent: toDecimal(data.taxPercent),
+          baseTotal: breakdown.gross,
+          chargesTotal: breakdown.charges,
+          taxTotal: breakdown.taxAmount,
+          totalAmount: breakdown.total,
+          depositPaid: toDecimal(0),
+          depositHeld: toDecimal(0),
+          amountPaid: toDecimal(0),
+          balance: breakdown.total,
+          startAt,
+          expectedReturnAt,
+          durationHours: toDecimal(hours),
+          notes: data.notes || null,
+          createdBy: ctx.userId,
         },
       });
-    }
 
-    await tx.asset.update({ where: { id: data.assetId }, data: { status: "reserved" } });
-    return created;
-  });
+      if (data.depositRequired > 0) {
+        await tx.deposit.create({
+          data: {
+            orgId: ctx.orgId,
+            rentalId: created.id,
+            amount: toDecimal(data.depositRequired),
+            status: "pending",
+          },
+        });
+      }
+
+      await tx.asset.update({ where: { id: data.assetId }, data: { status: "reserved" } });
+      return created;
+    });
+  } catch (error) {
+    if (error instanceof BookingConflictError) {
+      return { ok: false, error: error.message };
+    }
+    throw error;
+  }
+
+  const rentalNo = rental.rentalNo;
 
   await audit({
     orgId: ctx.orgId,
@@ -216,15 +235,6 @@ export async function extendRental(_prev: ActionResult, formData: FormData): Pro
     return { ok: false, error: "New return date must be after the current return date" };
   }
 
-  const { available, conflicts } = await isAssetAvailable(
-    ctx.orgId,
-    rental.assetId,
-    rental.expectedReturnAt,
-    toAt,
-    rental.id
-  );
-  if (!available) return { ok: false, error: "The asset is not available for the extended period" };
-
   const settings = await getOrgSettings(ctx.orgId);
   const hours = computeDurationHours(rental.expectedReturnAt, toAt);
   const breakdown = computeRentalTotals({
@@ -235,58 +245,81 @@ export async function extendRental(_prev: ActionResult, formData: FormData): Pro
     rounding: settings.rentalRules.roundingRule,
   });
 
-  await prisma.$transaction(async (tx) => {
-    await tx.rentalExtension.create({
-      data: {
-        orgId: ctx.orgId,
-        rentalId: rental.id,
-        fromAt: rental.expectedReturnAt,
+  // Same row-lock discipline as createRental: conflict-check while holding
+  // the asset lock so a concurrent booking cannot slip into the window.
+  try {
+    await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "Asset" WHERE "id" = ${rental.assetId} AND "orgId" = ${ctx.orgId} FOR UPDATE`;
+
+      const availability = await isAssetAvailable(
+        ctx.orgId,
+        rental.assetId,
+        rental.expectedReturnAt,
         toAt,
-        durationHours: toDecimal(hours),
-        additionalCost: data.additionalCost > 0 ? toDecimal(data.additionalCost) : breakdown.total,
-        additionalDeposit: toDecimal(data.additionalDeposit),
-        createdBy: ctx.userId,
-      },
-    });
-
-    const newBaseTotal = money.add(rental.baseTotal, breakdown.gross);
-    const newDepositRequired = money.add(rental.depositRequired, data.additionalDeposit);
-    const totalAmount = money.add(rental.totalAmount, data.additionalCost > 0 ? data.additionalCost : breakdown.total);
-    const newDepositHeld = money.add(rental.depositHeld, data.additionalDeposit);
-    const balance = money.sub(totalAmount, rental.amountPaid);
-
-    await tx.rental.update({
-      where: { id: rental.id },
-      data: {
-        expectedReturnAt: toAt,
-        baseTotal: newBaseTotal,
-        depositRequired: newDepositRequired,
-        totalAmount,
-        depositHeld: newDepositHeld,
-        balance,
-        durationHours: money.add(rental.durationHours, toDecimal(hours)),
-      },
-    });
-
-    if (data.additionalDeposit > 0) {
-      const deposit = await tx.deposit.findFirst({ where: { rentalId: rental.id, orgId: ctx.orgId } });
-      if (deposit) {
-        await tx.deposit.update({
-          where: { id: deposit.id },
-          data: { amount: money.add(deposit.amount, data.additionalDeposit) },
-        });
-      } else {
-        await tx.deposit.create({
-          data: {
-            orgId: ctx.orgId,
-            rentalId: rental.id,
-            amount: toDecimal(data.additionalDeposit),
-            status: "pending",
-          },
-        });
+        rental.id,
+        tx
+      );
+      if (!availability.available) {
+        throw new BookingConflictError("The asset is not available for the extended period");
       }
+
+      await tx.rentalExtension.create({
+        data: {
+          orgId: ctx.orgId,
+          rentalId: rental.id,
+          fromAt: rental.expectedReturnAt,
+          toAt,
+          durationHours: toDecimal(hours),
+          additionalCost: data.additionalCost > 0 ? toDecimal(data.additionalCost) : breakdown.total,
+          additionalDeposit: toDecimal(data.additionalDeposit),
+          createdBy: ctx.userId,
+        },
+      });
+
+      const newBaseTotal = money.add(rental.baseTotal, breakdown.gross);
+      // Only the agreed requirement grows here. depositPaid/depositHeld are
+      // updated when the additional deposit cash is actually received.
+      const newDepositRequired = money.add(rental.depositRequired, data.additionalDeposit);
+      const totalAmount = money.add(rental.totalAmount, data.additionalCost > 0 ? data.additionalCost : breakdown.total);
+      const balance = money.sub(totalAmount, rental.amountPaid);
+
+      await tx.rental.update({
+        where: { id: rental.id },
+        data: {
+          expectedReturnAt: toAt,
+          baseTotal: newBaseTotal,
+          depositRequired: newDepositRequired,
+          totalAmount,
+          balance,
+          durationHours: money.add(rental.durationHours, toDecimal(hours)),
+        },
+      });
+
+      if (data.additionalDeposit > 0) {
+        const deposit = await tx.deposit.findFirst({ where: { rentalId: rental.id, orgId: ctx.orgId } });
+        if (deposit) {
+          await tx.deposit.update({
+            where: { id: deposit.id },
+            data: { amount: money.add(deposit.amount, data.additionalDeposit) },
+          });
+        } else {
+          await tx.deposit.create({
+            data: {
+              orgId: ctx.orgId,
+              rentalId: rental.id,
+              amount: toDecimal(data.additionalDeposit),
+              status: "pending",
+            },
+          });
+        }
+      }
+    });
+  } catch (error) {
+    if (error instanceof BookingConflictError) {
+      return { ok: false, error: error.message };
     }
-  });
+    throw error;
+  }
 
   await audit({
     orgId: ctx.orgId,
@@ -344,6 +377,54 @@ export async function cancelRental(_prev: ActionResult, formData: FormData): Pro
 
   revalidatePath(`/rentals/${id}`);
   return { ok: true, message: "Rental cancelled" };
+}
+
+/**
+ * Finalizes a returned rental. Blocks while damage cases are open or the
+ * balance is unsettled, then completes the rental and releases the asset.
+ */
+export async function completeRental(_prev: ActionResult, formData: FormData): Promise<ActionResult> {
+  const ctx = await requirePermission(PERMISSIONS.manageRentals);
+  const id = String(formData.get("id") ?? "");
+  const rental = await prisma.rental.findFirst({ where: { id, orgId: ctx.orgId } });
+  if (!rental) return { ok: false, error: "Rental not found" };
+  if (rental.status !== "returned") {
+    return { ok: false, error: "Only returned rentals can be completed." };
+  }
+
+  const openDamages = await prisma.damage.count({
+    where: { rentalId: id, orgId: ctx.orgId, status: { notIn: ["resolved", "rejected"] } },
+  });
+  if (openDamages > 0) {
+    return {
+      ok: false,
+      error: `${openDamages} damage case(s) must be resolved or rejected before completing this rental.`,
+    };
+  }
+  if (rental.balance.greaterThan(0)) {
+    return { ok: false, error: "The outstanding balance must be settled before completing this rental." };
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.rental.update({ where: { id }, data: { status: "completed" } });
+    // Release the asset only if it was left in post-return inspection.
+    const asset = await tx.asset.findFirst({ where: { id: rental.assetId, orgId: ctx.orgId }, select: { status: true } });
+    if (asset?.status === "inspection") {
+      await tx.asset.update({ where: { id: rental.assetId }, data: { status: "available" } });
+    }
+  });
+
+  await audit({
+    orgId: ctx.orgId,
+    userId: ctx.userId,
+    action: "status_change",
+    entityType: "rental",
+    entityId: id,
+    description: `Completed rental ${rental.rentalNo}`,
+  });
+
+  revalidatePath(`/rentals/${id}`);
+  return { ok: true, message: "Rental completed" };
 }
 
 export async function computeLateFeeNow(rental: { expectedReturnAt: Date; actualReturnAt: Date; orgId: string }) {

@@ -108,6 +108,12 @@ model OrganizationSetting {
   @@index([orgId])
 }
 
+/// Atomic per-org document numbering, e.g. key = "{orgId}:rental".
+model Sequence {
+  key   String @id
+  value Int    @default(0)
+}
+
 // ============================================================
 // SUBSCRIPTIONS / BILLING (SaaS layer — payment provider abstracted)
 // ============================================================
@@ -351,8 +357,9 @@ model Rental {
   chargesTotal      Decimal  @default(0) // sum of extra charges
   taxTotal          Decimal  @default(0)
   totalAmount       Decimal  @default(0) // final amount due for rental (not deposit)
-  amountPaid        Decimal  @default(0) // payments applied to rental (non-deposit)
-  depositHeld       Decimal  @default(0)
+  amountPaid        Decimal  @default(0) // payments applied to rental (never includes deposits)
+  depositPaid       Decimal  @default(0) // cash received as security deposit
+  depositHeld       Decimal  @default(0) // currently retained = depositPaid - refunds - deductions
   balance           Decimal  @default(0)
   startAt           DateTime
   expectedReturnAt  DateTime

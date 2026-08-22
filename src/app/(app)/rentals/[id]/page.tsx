@@ -21,7 +21,7 @@ import { PaymentForm } from "@/components/rentals/payment-form";
 import { DepositPanel } from "@/components/rentals/deposit-panel";
 import { ChargeForm } from "@/components/rentals/charge-form";
 import { ExtensionForm } from "@/components/rentals/extension-form";
-import { cancelRental, computeLateFeeNow } from "@/server/actions/rentals";
+import { cancelRental, completeRental, computeLateFeeNow } from "@/server/actions/rentals";
 
 export const metadata: Metadata = { title: "Rental" };
 
@@ -106,6 +106,14 @@ export default async function RentalDetailPage({
                 <input type="hidden" name="id" value={rental.id} />
                 <Button type="submit" variant="outline" size="sm">
                   Cancel
+                </Button>
+              </form>
+            )}
+            {rental.status === "returned" && (
+              <form action={completeRental.bind(null, { ok: false }) as unknown as (fd: FormData) => void}>
+                <input type="hidden" name="id" value={rental.id} />
+                <Button type="submit" size="sm">
+                  Complete rental
                 </Button>
               </form>
             )}

@@ -167,6 +167,68 @@ export function computeDepositRefund(input: {
   return { totalDeduction: totalDeduction.toDecimalPlaces(2), refund };
 }
 
+// ------------------------------------------------------------
+// Ledger rules. Deposits are tracked separately from rental
+// revenue: `amountPaid`/`balance` never include deposit cash.
+// ------------------------------------------------------------
+
+const dec = (v: Prisma.Decimal | number | string) =>
+  v instanceof Prisma.Decimal ? v : new Prisma.Decimal(v.toString() || "0");
+
+/**
+ * Applies a recorded payment to the rental ledger.
+ * - deposit -> depositPaid/depositHeld grow; revenue untouched
+ * - refund  -> amountPaid shrinks (floored at zero), balance grows
+ * - other   -> amountPaid grows, balance recomputed against totalAmount
+ */
+export function applyPaymentToLedger(input: {
+  totalAmount: Prisma.Decimal | number | string;
+  amountPaid: Prisma.Decimal | number | string;
+  depositPaid: Prisma.Decimal | number | string;
+  depositHeld: Prisma.Decimal | number | string;
+  type: string;
+  amount: Prisma.Decimal | number | string;
+}): { amountPaid: Prisma.Decimal; balance: Prisma.Decimal; depositPaid: Prisma.Decimal; depositHeld: Prisma.Decimal } {
+  const totalAmount = dec(input.totalAmount);
+  let amountPaid = dec(input.amountPaid);
+  let depositPaid = dec(input.depositPaid);
+  let depositHeld = dec(input.depositHeld);
+  const amount = dec(input.amount);
+
+  if (input.type === "deposit") {
+    depositPaid = depositPaid.add(amount);
+    depositHeld = depositHeld.add(amount);
+  } else if (input.type === "refund") {
+    amountPaid = Prisma.Decimal.max(amountPaid.sub(amount), new Prisma.Decimal(0));
+  } else {
+    amountPaid = amountPaid.add(amount);
+  }
+  amountPaid = amountPaid.toDecimalPlaces(2);
+
+  const balance = totalAmount.sub(amountPaid).toDecimalPlaces(2);
+  return {
+    amountPaid,
+    balance,
+    depositPaid: depositPaid.toDecimalPlaces(2),
+    depositHeld: depositHeld.toDecimalPlaces(2),
+  };
+}
+
+/**
+ * Settles the deposit pool after finalization: both refunds and deductions
+ * release funds from custody. Never goes below zero.
+ */
+export function applyDepositSettlement(input: {
+  depositHeld: Prisma.Decimal | number | string;
+  refund: Prisma.Decimal | number | string;
+  totalDeduction: Prisma.Decimal | number | string;
+}): Prisma.Decimal {
+  const held = dec(input.depositHeld)
+    .sub(dec(input.refund))
+    .sub(dec(input.totalDeduction));
+  return Prisma.Decimal.max(held, new Prisma.Decimal(0)).toDecimalPlaces(2);
+}
+
 /**
  * Fuel / consumable charge: difference between configured return level and
  * actual return level, priced per percent.

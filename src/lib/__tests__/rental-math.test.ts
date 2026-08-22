@@ -7,6 +7,8 @@ import {
   computeLateFee,
   computeDepositRefund,
   computeFuelCharge,
+  applyPaymentToLedger,
+  applyDepositSettlement,
 } from "@/lib/rental-math";
 
 const D = (s: string) => new Date(s);
@@ -220,5 +222,72 @@ describe("Prisma.Decimal interop", () => {
   it("accepts Decimal inputs", () => {
     const r = computeRentalTotals({ pricingModel: "hourly", rate: new Prisma.Decimal("10.50"), hours: 2 });
     expect(r.total.toString()).toBe("21");
+  });
+});
+
+describe("applyPaymentToLedger", () => {
+  const state = (over: Record<string, number> = {}) => ({
+    totalAmount: 1000,
+    amountPaid: 0,
+    depositPaid: 0,
+    depositHeld: 0,
+    ...over,
+  });
+  const pay = (s: ReturnType<typeof state>, p: { type: string; amount: number }) =>
+    applyPaymentToLedger({ ...s, ...p });
+
+  it("routes deposit cash to depositPaid/depositHeld, not revenue", () => {
+    const r = pay(state(), { type: "deposit", amount: 500 });
+    expect(r.depositPaid.toString()).toBe("500");
+    expect(r.depositHeld.toString()).toBe("500");
+    expect(r.amountPaid.toString()).toBe("0");
+    expect(r.balance.toString()).toBe("1000"); // revenue untouched
+  });
+
+  it("routes rental payments to amountPaid and reduces balance", () => {
+    const r = pay(state(), { type: "rental", amount: 400 });
+    expect(r.amountPaid.toString()).toBe("400");
+    expect(r.balance.toString()).toBe("600");
+    expect(r.depositPaid.toString()).toBe("0");
+  });
+
+  it("treats late/damage/additional payments as revenue", () => {
+    const r = pay(state({ amountPaid: 100 }), { type: "late", amount: 50 });
+    expect(r.amountPaid.toString()).toBe("150");
+    expect(r.balance.toString()).toBe("850");
+  });
+
+  it("reduces amountPaid on refunds without going below zero", () => {
+    const r = pay(state({ amountPaid: 100 }), { type: "refund", amount: 300 });
+    expect(r.amountPaid.toString()).toBe("0");
+    expect(r.balance.toString()).toBe("1000");
+  });
+
+  it("keeps deposit custody separate from refunds of revenue", () => {
+    let r = applyPaymentToLedger({ totalAmount: 1000, amountPaid: 0, depositPaid: 0, depositHeld: 0, type: "deposit", amount: 500 });
+    r = applyPaymentToLedger({ ...r, totalAmount: 1000, type: "rental", amount: 1000 });
+    r = applyPaymentToLedger({ ...r, totalAmount: 1000, type: "refund", amount: 200 });
+    expect(r.depositPaid.toString()).toBe("500");
+    expect(r.depositHeld.toString()).toBe("500");
+    expect(r.amountPaid.toString()).toBe("800");
+    expect(r.balance.toString()).toBe("200");
+  });
+
+  it("rounds to 2 decimals", () => {
+    const r = pay(state({ totalAmount: 33.333 }), { type: "rental", amount: 0.005 });
+    expect(r.amountPaid.toString()).toBe("0.01");
+    expect(r.balance.toString()).toBe("33.32");
+  });
+});
+
+describe("applyDepositSettlement", () => {
+  it("subtracts refund and deductions from held custody", () => {
+    const held = applyDepositSettlement({ depositHeld: 500, refund: 300, totalDeduction: 100 });
+    expect(held.toString()).toBe("100");
+  });
+
+  it("never goes below zero", () => {
+    const held = applyDepositSettlement({ depositHeld: 100, refund: 150, totalDeduction: 50 });
+    expect(held.toString()).toBe("0");
   });
 });

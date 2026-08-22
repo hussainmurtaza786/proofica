@@ -20,24 +20,57 @@ const protectedPaths = [
 
 const publicPaths = ["/login", "/register", "/share"];
 
+/**
+ * Builds the per-request Content-Security-Policy. Scripts are gated by a
+ * per-request nonce with 'strict-dynamic'; 'unsafe-eval' is allowed in
+ * development only (React refresh requires it).
+ */
+function buildCsp(nonce: string): string {
+  const dev = process.env.NODE_ENV !== "production";
+  return [
+    "default-src 'self'",
+    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${dev ? " 'unsafe-eval'" : ""}`,
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+  ].join("; ");
+}
+
 export async function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
+  // Per-request nonce. Setting the CSP on the REQUEST headers lets
+  // Next.js stamp its own script tags with the same nonce.
+  const nonce = btoa(crypto.randomUUID());
+  const csp = buildCsp(nonce);
+
+  const requestHeaders = new Headers(req.headers);
+  requestHeaders.set("x-nonce", nonce);
+  requestHeaders.set("Content-Security-Policy", csp);
+
+  const response = NextResponse.next({ request: { headers: requestHeaders } });
+  response.headers.set("Content-Security-Policy", csp);
+
   if (publicPaths.some((p) => pathname.startsWith(p))) {
-    return NextResponse.next();
+    return response;
   }
 
   if (pathname.startsWith("/api/auth")) {
-    return NextResponse.next();
+    return response;
   }
 
   if (pathname.startsWith("/api/files")) {
-    return NextResponse.next();
+    return response;
   }
 
   const needsAuth = protectedPaths.some((p) => pathname.startsWith(p));
   if (!needsAuth) {
-    return NextResponse.next();
+    return response;
   }
 
   const token = await getToken({
@@ -51,7 +84,7 @@ export async function middleware(req: NextRequest) {
     return NextResponse.redirect(loginUrl);
   }
 
-  return NextResponse.next();
+  return response;
 }
 
 export const config = {

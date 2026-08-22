@@ -15,7 +15,7 @@ import { toDecimal, money } from "@/lib/decimal";
 import { audit } from "@/services/audit";
 import { notify } from "@/services/notify";
 import { getOrgSettings } from "@/services/settings";
-import { computeLateFee, computeFuelCharge, computeDepositRefund } from "@/lib/rental-math";
+import { computeLateFee, computeFuelCharge } from "@/lib/rental-math";
 import type { ActionResult } from "@/lib/actions";
 
 // ------------------------------------------------------------
@@ -194,14 +194,14 @@ export async function saveInspectionItems(_prev: ActionResult, formData: FormDat
     for (const item of data.items) {
       const value = item.afterValue || item.beforeValue || item.status;
       if (item.id) {
-        await tx.inspectionItem.update({
-          where: { id: item.id },
+        // Scoped to this inspection/org so client-supplied IDs from another
+        // tenant can never be written to (IDOR).
+        await tx.inspectionItem.updateMany({
+          where: { id: item.id, inspectionId: inspection.id, orgId: ctx.orgId },
           data: {
             [target]: value,
             status: item.status,
             notes: item.notes || null,
-            afterValue: item.afterValue || null,
-            beforeValue: item.beforeValue || null,
           },
         });
       } else {
@@ -240,11 +240,13 @@ export async function saveDamages(_prev: ActionResult, formData: FormData): Prom
   });
   if (!inspection) return { ok: false, error: "Inspection not found" };
 
-  await prisma.$transaction(async (tx) => {
+  const txResult = await prisma.$transaction(async (tx): Promise<ActionResult | null> => {
     for (const d of data.damages) {
       if (d.id) {
-        await tx.damage.update({
-          where: { id: d.id },
+        // Scoped to this org so client-supplied IDs from another tenant
+        // can never be written to (IDOR).
+        const result = await tx.damage.updateMany({
+          where: { id: d.id, orgId: ctx.orgId },
           data: {
             category: d.category,
             location: d.location || null,
@@ -255,6 +257,9 @@ export async function saveDamages(_prev: ActionResult, formData: FormData): Prom
             positionY: d.positionY ?? null,
           },
         });
+        if (result.count === 0) {
+          return { ok: false, error: "Damage record not found" };
+        }
       } else {
         await tx.damage.create({
           data: {
@@ -275,7 +280,9 @@ export async function saveDamages(_prev: ActionResult, formData: FormData): Prom
         });
       }
     }
+    return null;
   });
+  if (txResult) return txResult;
 
   if (inspection.type === "return") {
     const newDamageCount = data.damages.filter((d) => !d.isPreExisting).length;
@@ -492,7 +499,9 @@ export async function completeInspection(_prev: ActionResult, formData: FormData
       await tx.rental.update({
         where: { id: rental.id },
         data: {
-          status: "completed",
+          // Returned, not completed: the rental is finalized explicitly via
+          // completeRental once damages/deposit/balance are settled.
+          status: "returned",
           actualReturnAt,
           chargesTotal,
           taxTotal,
@@ -500,7 +509,8 @@ export async function completeInspection(_prev: ActionResult, formData: FormData
           balance,
         },
       });
-      await tx.asset.update({ where: { id: rental.assetId }, data: { status: "available" } });
+      // Held for post-return review; released to "available" by completeRental.
+      await tx.asset.update({ where: { id: rental.assetId }, data: { status: "inspection" } });
     });
 
     await audit({
@@ -514,9 +524,9 @@ export async function completeInspection(_prev: ActionResult, formData: FormData
 
     await notify({
       orgId: ctx.orgId,
-      type: "rental_due",
-      title: "Rental completed",
-      body: `Rental ${rental.rentalNo} was returned and completed. Finalize the deposit to refund ${rental.deposits[0]?.amount ?? 0}.`,
+      type: "inspection_pending",
+      title: "Rental returned",
+      body: `Rental ${rental.rentalNo} was returned. Review damages and finalize the deposit to complete it.`,
       link: `/rentals/${rental.id}`,
     });
   }

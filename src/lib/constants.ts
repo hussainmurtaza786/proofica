@@ -236,6 +236,7 @@ export const NOTIFICATION_TYPES = [
   "rental_due",
   "rental_overdue",
   "payment_overdue",
+  "payment_received",
   "deposit_pending",
   "inspection_pending",
   "damage_detected",

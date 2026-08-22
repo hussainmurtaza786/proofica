@@ -107,11 +107,25 @@ export function buildFileKey(orgId: string, folder: string, originalName: string
   return `${orgId}/${folder}/${randomUUID()}${safe}`;
 }
 
-export async function fileKeyToBuffer(key: string): Promise<Buffer> {
+/**
+ * Resolves a storage key to an absolute path, or null when the key would
+ * escape the storage root. Uses path.relative containment rather than a
+ * bare startsWith, which wrongly accepts sibling directories such as
+ * "<root>-evil" (prefix-match bug).
+ */
+export function resolveStoragePath(key: string): string | null {
   const storageDir = process.env.STORAGE_LOCAL_DIR || "storage";
-  const root = path.resolve(storageDir);
-  const filePath = path.resolve(path.join(process.cwd(), storageDir, key));
-  if (!filePath.startsWith(root)) throw new Error("Invalid file path");
+  const root = path.resolve(process.cwd(), storageDir);
+  const target = path.resolve(root, key);
+  if (target === root) return null; // never serve the root itself
+  const rel = path.relative(root, target);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  return target;
+}
+
+export async function fileKeyToBuffer(key: string): Promise<Buffer> {
+  const filePath = resolveStoragePath(key);
+  if (!filePath) throw new Error("Invalid file path");
   return readFile(filePath);
 }
 

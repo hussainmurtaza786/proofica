@@ -2,10 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { auth } from "@/auth/auth";
+import { resolveStoragePath } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
-
-const ROOT = path.resolve(process.env.STORAGE_LOCAL_DIR || "./storage");
 
 function mimeFor(ext: string): string {
   switch (ext.toLowerCase()) {
@@ -37,10 +36,9 @@ export async function GET(
   const { key } = await context.params;
   const relative = key.join(path.sep);
 
-  // Prevent path traversal.
-  const safe = path.normalize(relative).replace(/^(\.\.[\/\\])+/, "");
-  const full = path.resolve(ROOT, safe);
-  if (!full.startsWith(ROOT)) {
+  // Containment check: rejects traversal outside the storage root.
+  const full = resolveStoragePath(relative);
+  if (!full) {
     return new NextResponse("Not found", { status: 404 });
   }
 

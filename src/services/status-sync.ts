@@ -89,7 +89,7 @@ export async function runOrgJobs(orgId: string) {
 
   // 4) Outstanding balances (payment overdue)
   const outstanding = await prisma.rental.findMany({
-    where: { orgId, balance: { gt: 0 }, status: { in: ["active", "overdue", "completed"] } },
+    where: { orgId, balance: { gt: 0 }, status: { in: ["active", "overdue", "returned", "completed"] } },
     include: { customer: true },
   });
   for (const rental of outstanding) {
